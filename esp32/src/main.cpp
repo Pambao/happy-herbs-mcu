@@ -5,10 +5,12 @@
 #include <FS.h>
 #include <PubSubClient.h>
 #include <SPIFFS.h>
-#include <TaskScheduler.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
+
+#define _TASK_STD_FUNCTION
+#include <TaskScheduler.h>
 
 #include "constants.h"
 #include "happy_herbs.h"
@@ -22,94 +24,134 @@ char* awsClientKey;
 
 // Create an object to interact with the light sensor driver
 BH1750 lightSensorBH1750(HH_I2C_BH1750_ADDR);
-DHT tempMoisSensorDHT(HH_GPIO_DHT, DHT11);
+DHT tempHumidSensorDHT(HH_GPIO_DHT, DHT11);
+
 // Create a wifi client that uses SSL client authentication
 WiFiClientSecure wifiClient;
 // Create a wifi client that communicates with AWS
 PubSubClient pubsubClient(wifiClient);
 
+Scheduler scheduler;
+
 // State manager and hardware controller
-HappyHerbsState hhState(lightSensorBH1750, tempMoisSensorDHT, HH_GPIO_LAMP, HH_GPIO_PUMP, HH_GPIO_MOIS,
-                        DEFAULT_LIGHT_THRES, DEFAULT_MOIS_THRES);
+HappyHerbsState hhState(lightSensorBH1750, tempHumidSensorDHT, HH_GPIO_LAMP,
+                        HH_GPIO_PUMP, HH_GPIO_MOISTURE);
 // Service for managing statea and communication with server
-HappyHerbsService *hhService;
+HappyHerbsService hhService(hhState, pubsubClient);
 
-Scheduler taskManager;
+/**
+ * This task run constantly and keep the connection with AWS alive, if the
+ * connection is dropped the system will try to reconnect and sync its state
+ * with AWS upon reconnection.
+ */
+Task tHappyHerbsServiceLoop(
+    TASK_IMMEDIATE, TASK_FOREVER,
+    []() {
+      if (hhService.connected()) {
+        hhService.loop();
+        return;
+      }
+      if (hhService.connect()) {
+        hhService.publishShadowUpdate();
+      }
+    },
+    &scheduler, true);
 
-Task tReconnectAWSIoT(TASK_SECOND, TASK_FOREVER, []() {
-  if (!hhService->connected()) {
-    hhService->reconnect();
-  }
-  hhService->loop();
-});
+/**
+ * This task takes measurements from every sensor and publish it to AWS, along
+ * with the shadow's state, for every 10 minutes.
+ */
+Task tPeriodicStateSnapshotPublish(
+    10 * TASK_MINUTE, TASK_FOREVER,
+    []() {
+      ledBlink(LED_BUILTIN, 100, 100, 2);
+      hhService.publishStateSnapshot();
+    },
+    &scheduler, true);
 
-Task tPublishCurrentSensorsMeasurements(10 * 60 * 1000, TASK_FOREVER, []() {
-  hhService->publishCurrentSensorsMeasurements();
-});
+/**
+ * This task takes measurements from every sensor and publish it to AWS for
+ * every 10 minutes.
+ */
+Task tPeriodicSensorsMeasurementsPublish(
+    10 * TASK_MINUTE, TASK_FOREVER,
+    []() {
+      ledBlink(LED_BUILTIN, 100, 100, 2);
+      hhService.publishSensorsMeasurements();
+    },
+    &scheduler, true);
 
-Task tPump(3000, TASK_ONCE, NULL, &taskManager, false,
-  [](){
-    Serial.print("Watering for 3 seconds... ");
-    hhState.writePumpPinID(true);
-    return true;
-  },
-  [](){
-    Serial.println("\tPump Off");
-    hhState.writePumpPinID(false);
-});
+/**
+ * Publish a message every 5 minutes to query AWS for the latest shadow
+ */
+Task tPeriodicShadowGetPublish(
+    5 * TASK_MINUTE, TASK_FOREVER,
+    []() {
+      ledBlink(LED_BUILTIN, 100, 100, 2);
+      hhService.publishShadowGet();
+    },
+    &scheduler, true);
 
-Task tPumpInterval(15 * 60 * 1000, TASK_FOREVER, [](){
-  if(hhState.readMoisSensor() < hhState.getMoisThreshHold())
-    tPump.restartDelayed();
-});
+/**
+ * This task periodically take measurement on the moisture sensor and compare
+ * the result with the user's threshold, if the moisture is not high enough,
+ * restart the task that starts the pump
+ */
+Task taskStartWateringBaseOnMoisture(
+    15 * TASK_MINUTE, TASK_FOREVER,
+    []() {
+      ledBlink(LED_BUILTIN, 100, 100, 2);
+      float moisture = hhState.readMoistureSensor();
+      if (moisture < hhState.getMoistureThreshold()) {
+        Serial.printf("MOISTURE IS LOW %f.2 < %f.2\n", moisture,
+                      hhState.getMoistureThreshold());
+        hhService.getTaskPlantWatering().restartDelayed();
+      }
+    },
+    &scheduler, false);
 
-Task tLampInterval(60 * 60 * 1000, TASK_FOREVER, [](){
-  hhState.writeLampPinID(false);
-  if(hhState.readLightSensorBH1750() < hhState.getLightThreshHold())
-    hhState.writeLampPinID(true);
-});
+/**
+ * This task periodically take measurement on the light sensor and compare
+ * the result with the user's threshold, if the light level is not high enough,
+ * turn on the connected lamp
+ */
+Task taskTurnOnLampBaseOnLightMeter(
+    30 * TASK_MINUTE, TASK_FOREVER,
+    []() {
+      ledBlink(LED_BUILTIN, 100, 100, 2);
+      hhService.writeLampPinID(false);
+      float lightLevel = hhState.readLightSensorBH1750();
+      if (lightLevel < hhState.getLightThreshold()) {
+        Serial.printf("LIGHT LEVEL IS LOW %f.2 < %f.2\n", lightLevel,
+                      hhState.getLightThreshold());
+        Serial.println("TURN ON LAMP");
+        hhService.writeLampPinID(true);
+      }
+    },
+    &scheduler, false);
 
 void setup() {
-  pinMode(HH_GPIO_LAMP, OUTPUT);
-  pinMode(HH_GPIO_PUMP, OUTPUT);
-  pinMode(HH_GPIO_MOIS, INPUT);
+  pinMode(LED_BUILTIN, OUTPUT);      // digital
+  pinMode(HH_GPIO_LAMP, OUTPUT);     // digital
+  pinMode(HH_GPIO_PUMP, OUTPUT);     // digital
+  pinMode(HH_GPIO_MOISTURE, INPUT);  // analog
   Serial.begin(SERIAL_BAUD_RATE);
   while (!Serial)
     ;
-  Wire.begin(HH_GPIO_BH1750_SDA, HH_GPIO_BH1750_SCL);
+  Wire.begin(I2C_SDA0, I2C_SCL0);
+
+  if (!SPIFFS.begin()) {
+    Serial.println("Could not start file system");
+    return;
+  }
 
   if (!lightSensorBH1750.begin(BH1750::CONTINUOUS_HIGH_RES_MODE_2)) {
     Serial.println("Could not begin BH1750 light sensor");
   }
 
-  // ================ START FILE SYSTEM AND LOAD CONFIGURATIONS ================
-  if (!SPIFFS.begin()) {
-    return;
-  }
-
-  awsEndpoint = loadFile(AWS_IOT_ENDPOINT.c_str());
-  if (!awsEndpoint) {
-    return;
-  }
-
-  awsRootCACert = loadFile(AWS_ROOTCA_CERT.c_str());
-  if (!awsRootCACert) {
-    return;
-  }
-
-  awsClientCert = loadFile(AWS_CLIENT_CERT.c_str());
-  if (!awsClientCert) {
-    return;
-  }
-
-  awsClientKey = loadFile(AWS_CLIENT_KEY.c_str());
-  if (!awsClientKey) {
-    return;
-  }
-
-  // ================ CONNECT TO WIFI AND SETUP LOCAL TIME ================
+  // ================ CONNECT TO WIFI ================
   char* miscCreds = loadFile(MISC_CREDS.c_str());
-  StaticJsonDocument<512> miscCredsJson;
+  StaticJsonDocument<MQTT_MESSAGE_BUFFER_SIZE> miscCredsJson;
   deserializeJson(miscCredsJson, miscCreds);
   free(miscCreds);
 
@@ -123,43 +165,60 @@ void setup() {
   }
   Serial.println("connected!");
 
+  // ================ SYNC WITH NTP SERVER ================
   int ntpTimezoneOffset = miscCredsJson["ntpTimezoneOffset"];
   int ntpDaylightOffset = miscCredsJson["ntpDaylightOffset"];
   configTime(ntpTimezoneOffset, ntpDaylightOffset, NTP_SERVER.c_str());
 
-  // ================ SETUP MQTT CLIENT ================
+  // ======== SETUP KEY AND CERTIFICATES FOR CLIENT AUTH ========
+  awsEndpoint = loadFile(AWS_IOT_ENDPOINT.c_str());
+  if (!awsEndpoint) {
+    Serial.println("Could not read AWS endpoint from file");
+    return;
+  }
+  awsRootCACert = loadFile(AWS_ROOTCA_CERT.c_str());
+  if (!awsRootCACert) {
+    Serial.println("Could not read root CA certificate from file");
+    return;
+  }
+  awsClientCert = loadFile(AWS_CLIENT_CERT.c_str());
+  if (!awsClientCert) {
+    Serial.println("Could not read client certificate from file");
+    return;
+  }
+  awsClientKey = loadFile(AWS_CLIENT_KEY.c_str());
+  if (!awsClientKey) {
+    Serial.println("Could not read client key from file");
+    return;
+  }
+
   wifiClient.setCACert(awsRootCACert);
   wifiClient.setCertificate(awsClientCert);
   wifiClient.setPrivateKey(awsClientKey);
 
+  // ================ SETUP MQTT CLIENT ================
   pubsubClient.setServer(awsEndpoint, 8883);
+  pubsubClient.setBufferSize(MQTT_MESSAGE_BUFFER_SIZE);
   pubsubClient.setCallback([](char* topic, byte* payload, unsigned int length) {
-    Serial.print("RECV [");
-    Serial.print(topic);
-    Serial.print("]");
-    Serial.print(" : ");
-    Serial.println((char*)payload);
-    hhService->handleCallback(topic, payload, length);
+    hhService.handleCallback(topic, payload, length);
   });
 
+  // ================ SETUP STATE AND SERVICE ================
   String awsThingName = loadFile(AWS_THING_NAME.c_str());
   if (!awsThingName) {
-    return;
+    Serial.println("Could not read AWS thing's name from file");
   }
+  hhService.setThingName(awsThingName);
+  hhService.setupTaskPlantWatering(scheduler, 5 * TASK_SECOND);
+
   hhState.writeLampPinID(false);
   hhState.writePumpPinID(false);
-  hhService = new HappyHerbsService(awsThingName, pubsubClient, hhState);
+  hhState.setLightThreshold(DEFAULT_LIGHT_THRESHOLD);
+  hhState.setMoistureThreshold(DEFAULT_MOISTURE_THRESHOLD);
 
-  // ================ SETUP SCHEDULER ================
-  taskManager.addTask(tReconnectAWSIoT);
-  taskManager.addTask(tPublishCurrentSensorsMeasurements);
-  taskManager.addTask(tPumpInterval);
-  taskManager.addTask(tLampInterval);
-
-  tReconnectAWSIoT.enable();
-  tPublishCurrentSensorsMeasurements.enable();
-  tPumpInterval.enable();
-  tLampInterval.enable();
+  // enable tasks after all necessary states have been initialized
+  taskTurnOnLampBaseOnLightMeter.enable();
+  taskStartWateringBaseOnMoisture.enable();
 }
 
-void loop() { taskManager.execute(); }
+void loop() { scheduler.execute(); }
